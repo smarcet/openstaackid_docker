@@ -1,0 +1,7 @@
+SHELL=/bin/bash
+
+* * * * * www-data cd @WEB_DIR && php artisan schedule:run >> /dev/null 2>&1
+
+# check supervisor status each 5 minutes
+*/5 * * * * root /etc/scripts/supervisor_watchdog.sh >> /var/log/supervisor_watchdog.log 2>&1
+
