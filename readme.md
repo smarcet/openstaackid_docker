@@ -11,7 +11,7 @@ docker build -t idp_test --target test --no-cache .
 ## run
 
 ````bash
- docker run -t --rm idp_test ./tests.sh   
+ docker run -t --rm idp_test ./tests.sh <SHA1_COMMIT> [OPTIONAL] 
 ````
 
 # Build

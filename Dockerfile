@@ -61,8 +61,8 @@ ENV DB_NAME=$DB_NAME
 
 RUN apt-get update && \
   apt-get -y install git wget gnupg apt-utils software-properties-common tar zip curl lsof nano htop \
-  redis-tools nginx unzip mysql-client-core-8.0 build-essential ufw apt-utils sed iputils-ping net-tools sudo supervisor \
-  apt-utils rsyslog cron unattended-upgrades
+  redis-tools unzip mysql-client-core-8.0 build-essential apt-utils sed iputils-ping net-tools sudo \
+  apt-utils rsyslog unattended-upgrades
 
 RUN dpkg-reconfigure unattended-upgrades
 
@@ -83,13 +83,11 @@ RUN curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
 RUN echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
 RUN  apt update && apt install -y yarn
 
-RUN  if [ "$APP_ENV" = "local" ] ; then \
-mkdir -p /etc/letsencrypt/live/$SERVER_NAME && \
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
--subj "/C=US/ST=California/L=San Francisco/O=FNTech/OU=IT Department/CN=${SERVER_NAME}" \
--keyout /etc/letsencrypt/live/$SERVER_NAME/privkey.pem \
--out /etc/letsencrypt/live/$SERVER_NAME/fullchain.pem; \
-fi
+# config dir
+
+RUN mkdir -p $CONFIG_DIR && \
+    chown root:www-data $CONFIG_DIR && \
+    chmod 770 $CONFIG_DIR
 
 # php config
 COPY php/fpm/php.ini $PHP_FPM_HOME/php.ini
@@ -101,18 +99,102 @@ RUN sed -i "s*@PHP_PM_MAX_CHILDREN*$PHP_PM_MAX_CHILDREN*g" $PHP_FPM_HOME/pool.d/
 RUN sed -i "s*@PHP_LISTEN*$PHP_LISTEN*g" $PHP_FPM_HOME/pool.d/www.conf
 
 RUN mkdir -p /run/php
-COPY nginx/gzip.conf $NGINX_HOME/gzip.conf
+
+# entry point
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod 770 /usr/local/bin/docker-entrypoint.sh \
+    && ln -s /usr/local/bin/docker-entrypoint.sh /
+
+# deployment file
+
+RUN mkdir -p /etc/scripts && chmod 770 /etc/scripts
+COPY scripts/deployment.sh /etc/scripts/deployment.sh
+COPY scripts/server-status.sh /etc/scripts/server-status.sh
+COPY scripts/supervisor_watchdog.sh /etc/scripts/supervisor_watchdog.sh
+RUN cd /etc/scripts && chmod 770 *.sh
+RUN ln -s /etc/scripts/deployment.sh /usr/local/bin/deployment.sh && \
+    ln -s /etc/scripts/deployment.sh /
+
+VOLUME $STORAGE_HOME
+
+FROM base AS test
+
+COPY app/.env.testing $CONFIG_DIR/.env.testing
+
+RUN chown root:www-data $CONFIG_DIR/.env.testing && \
+    chmod 640 $CONFIG_DIR/.env.testing
+# replace variables
+RUN sed -i "s/@REDIS_PORT/$REDIS_PORT/g" $CONFIG_DIR/.env.testing
+RUN sed -i "s/@REDIS_PASSWORD/$REDIS_PASSWORD/g" $CONFIG_DIR/.env.testing
+RUN sed -i "s/@DB_USER/$DB_USER/g" $CONFIG_DIR/.env.testing
+RUN sed -i "s/@DB_NAME/$DB_NAME/g" $CONFIG_DIR/.env.testing
+RUN sed -i "s/@DB_PASSWORD/$DB_PASSWORD/g" $CONFIG_DIR/.env.testing
+RUN sed -i "s/@SERVER_NAME/$SERVER_NAME/g" $CONFIG_DIR/.env.testing
+RUN sed -i "s/@NODE_NBR/$NODE_NBR/g" $CONFIG_DIR/.env.testing
+RUN  ln -s $CONFIG_DIR/.env.testing $CONFIG_DIR/.env
+
+# local mysql config / redis
+
+RUN apt-get -y install mysql-server redis zip unzip
+RUN service mysql stop
+RUN usermod -d /var/lib/mysql/ mysql
+RUN mkdir -p /var/lib/mysql /var/run/mysqld \
+    && chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
+    && chmod 777 /var/run/mysqld
+RUN sed -i 's/# pid-file/pid-file/' /etc/mysql/mysql.conf.d/mysqld.cnf
+RUN sed -i 's/# socket/socket/' /etc/mysql/mysql.conf.d/mysqld.cnf
+RUN sed -i 's/mysqlx-bind-address/# mysqlx-bind-address/' /etc/mysql/mysql.conf.d/mysqld.cnf
+RUN echo "max_connections = 1024" >> /etc/mysql/mysql.conf.d/mysqld.cnf;
+RUN echo 'sql_mode = "NO_ENGINE_SUBSTITUTION"' >> /etc/mysql/mysql.conf.d/mysqld.cnf;
+
+VOLUME /var/lib/mysql
+# local redis config
+COPY scripts/tests.sh /etc/scripts/tests.sh
+RUN cd /etc/scripts && chmod 770 *.sh
+COPY redis/redis.conf.$APP_ENV /etc/redis/redis.conf
+
+# replace variables
+RUN sed -i "s/@REDIS_PORT/$REDIS_PORT/g" /etc/redis/redis.conf
+RUN sed -i "s/@REDIS_PASSWORD/$REDIS_PASSWORD/g" /etc/redis/redis.conf
+RUN mkdir -p /var/run/redis
+
+RUN ln -s /etc/scripts/tests.sh /usr/local/bin/tests.sh && \
+    ln -s /etc/scripts/tests.sh /
+
+RUN mkdir -p /var/www
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+
+FROM base AS deploy
+
+# install needed packages to run the site
+RUN apt-get update && \
+  apt-get -y install nginx ufw supervisor cron
+
+# generate self signed cert if we are on local env
+
+RUN  if [ "$APP_ENV" = "local" ] ; then \
+mkdir -p /etc/letsencrypt/live/$SERVER_NAME && \
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+-subj "/C=US/ST=California/L=San Francisco/O=FNTech/OU=IT Department/CN=${SERVER_NAME}" \
+-keyout /etc/letsencrypt/live/$SERVER_NAME/privkey.pem \
+-out /etc/letsencrypt/live/$SERVER_NAME/fullchain.pem; \
+fi
+
+# nginx config files
 
 COPY nginx/nginx.conf $NGINX_HOME/nginx.conf
-RUN sed -i "s*@NGINX_CLIENT_MAX_BODY*$NGINX_CLIENT_MAX_BODY*g" $NGINX_HOME/nginx.conf
-
+COPY nginx/gzip.conf $NGINX_HOME/gzip.conf
 COPY nginx/php-fpm.conf $NGINX_HOME/php-fpm.conf
+COPY nginx/snippets/letsencrypt.conf $NGINX_HOME/snippets/letsencrypt.conf
+COPY nginx/sites-available/idp.conf $NGINX_HOME/sites-available/$SERVER_NAME
+
+# replace variables
+
+RUN sed -i "s*@NGINX_CLIENT_MAX_BODY*$NGINX_CLIENT_MAX_BODY*g" $NGINX_HOME/nginx.conf
 RUN sed -i "s*@PHP_LISTEN*$PHP_LISTEN*g" $NGINX_HOME/php-fpm.conf
 RUN sed -i "s*@NGINX_FASTCGI_TIMEOUT*$NGINX_FASTCGI_TIMEOUT*g" $NGINX_HOME/php-fpm.conf
-
-COPY nginx/snippets/letsencrypt.conf $NGINX_HOME/snippets/letsencrypt.conf
 RUN mkdir -p /etc/ssl && cd /etc/ssl && openssl dhparam -out ssl-dhparams.pem 2048
-COPY nginx/sites-available/idp.conf $NGINX_HOME/sites-available/$SERVER_NAME
 RUN sed -i "s/@SERVER_NAME/$SERVER_NAME/g" $NGINX_HOME/sites-available/$SERVER_NAME
 RUN sed -i "s*@WEB_DIR*$WEB_DIR*g" $NGINX_HOME/sites-available/$SERVER_NAME
 
@@ -135,78 +217,9 @@ RUN touch /var/log/cron.log
 
 # supervisor
 COPY supervisor/supervisor.conf /etc/supervisor/conf.d/supervisor.conf
+
 RUN sed -i "s*@WEB_DIR*$WEB_DIR*g" /etc/supervisor/conf.d/supervisor.conf
 RUN sed -i "s*@PHP_VERSION*$PHP_VERSION*g" /etc/supervisor/conf.d/supervisor.conf
-
-# entry point
-COPY docker-entrypoint.sh /usr/local/bin/
-RUN chmod 770 /usr/local/bin/docker-entrypoint.sh \
-    && ln -s /usr/local/bin/docker-entrypoint.sh /
-
-RUN mkdir -p /etc/scripts && chmod 770 /etc/scripts
-COPY scripts/deployment.sh /etc/scripts/deployment.sh
-COPY scripts/server-status.sh /etc/scripts/server-status.sh
-COPY scripts/supervisor_watchdog.sh /etc/scripts/supervisor_watchdog.sh
-RUN cd /etc/scripts && chmod 770 *.sh
-RUN ln -s /etc/scripts/deployment.sh /usr/local/bin/deployment.sh && \
-    ln -s /etc/scripts/deployment.sh /
-# deployment file
-
-# forward request and error logs to docker log collector
-RUN touch /var/log/supervisord.log && \
-    ln -sf /dev/stdout /var/log/supervisord.log
-
-VOLUME $STORAGE_HOME
-
-FROM base AS test
-
-COPY app/.env.testing $CONFIG_DIR/.env.testing
-
-RUN chown root:www-data $CONFIG_DIR/.env.testing && \
-    chmod 640 $CONFIG_DIR/.env.testing
-# replace variables
-RUN sed -i "s/@REDIS_PORT/$REDIS_PORT/g" $CONFIG_DIR/.env.testing
-RUN sed -i "s/@REDIS_PASSWORD/$REDIS_PASSWORD/g" $CONFIG_DIR/.env.testing
-RUN sed -i "s/@DB_USER/$DB_USER/g" $CONFIG_DIR/.env.testing
-RUN sed -i "s/@DB_NAME/$DB_NAME/g" $CONFIG_DIR/.env.testing
-RUN sed -i "s/@DB_PASSWORD/$DB_PASSWORD/g" $CONFIG_DIR/.env.testing
-RUN sed -i "s/@SERVER_NAME/$SERVER_NAME/g" $CONFIG_DIR/.env.testing
-RUN sed -i "s/@NODE_NBR/$NODE_NBR/g" $CONFIG_DIR/.env.testing
-RUN  ln -s $CONFIG_DIR/.env.testing $CONFIG_DIR/.env
-
-# local mysql config / redis
-RUN apt-get -y install mysql-server redis zip unzip
-RUN service mysql stop
-RUN usermod -d /var/lib/mysql/ mysql
-RUN mkdir -p /var/lib/mysql /var/run/mysqld \
-    && chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
-    && chmod 777 /var/run/mysqld
-RUN sed -i 's/# pid-file/pid-file/' /etc/mysql/mysql.conf.d/mysqld.cnf
-RUN sed -i 's/# socket/socket/' /etc/mysql/mysql.conf.d/mysqld.cnf
-RUN sed -i 's/mysqlx-bind-address/# mysqlx-bind-address/' /etc/mysql/mysql.conf.d/mysqld.cnf
-RUN echo "max_connections = 1024" >> /etc/mysql/mysql.conf.d/mysqld.cnf;
-RUN echo 'sql_mode = "NO_ENGINE_SUBSTITUTION"' >> /etc/mysql/mysql.conf.d/mysqld.cnf;
-
-VOLUME /var/lib/mysql
-# local redis config
-COPY scripts/tests.sh /etc/scripts/tests.sh
-RUN cd /etc/scripts && chmod 770 *.sh
-COPY redis/redis.conf.$APP_ENV /etc/redis/redis.conf
-# replace variables
-RUN sed -i "s/@REDIS_PORT/$REDIS_PORT/g" /etc/redis/redis.conf
-RUN sed -i "s/@REDIS_PASSWORD/$REDIS_PASSWORD/g" /etc/redis/redis.conf
-RUN mkdir -p /var/run/redis
-
-RUN ln -s /etc/scripts/tests.sh /usr/local/bin/tests.sh && \
-    ln -s /etc/scripts/tests.sh /
-
-ENTRYPOINT ["/docker-entrypoint.sh"]
-
-FROM base AS deploy
-
-RUN mkdir -p $CONFIG_DIR && \
-    chown root:www-data $CONFIG_DIR && \
-    chmod 770 $CONFIG_DIR
 
 COPY app/.env.$APP_ENV $CONFIG_DIR/.env
 
@@ -219,7 +232,12 @@ RUN sed -i "s/@REDIS_PASSWORD/$REDIS_PASSWORD/g" $CONFIG_DIR/.env
 RUN sed -i "s/@SERVER_NAME/$SERVER_NAME/g" $CONFIG_DIR/.env
 RUN sed -i "s/@NODE_NBR/$NODE_NBR/g" $CONFIG_DIR/.env
 # do intial deployment
-RUN ./deployment.sh 1 "$TAG" "$CHANGE"
+RUN ./deployment.sh 1 "DEPLOY" "$CHANGE"
+
+# forward request and error logs to docker log collector
+RUN touch /var/log/supervisord.log && \
+    ln -sf /dev/stdout /var/log/supervisord.log
+
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["supervisord"]
 

@@ -1,11 +1,15 @@
 #!/bin/bash
+
+CHANGE=$1
+ROLE="TEST"
+
 service redis-server start
 service mysql start \
     & sleep 10
 echo "DB_USER $DB_USER DB_NAME $DB_NAME..."
 mysql -e "CREATE USER $DB_USER@'%' IDENTIFIED BY '$DB_PASSWORD';CREATE DATABASE IF NOT EXISTS $DB_NAME;GRANT ALL ON $DB_NAME.* TO '$DB_USER'@'%';FLUSH PRIVILEGES;" \
 
-./deployment.sh 0
+./deployment.sh 0 $ROLE $CHANGE
 
 ln -s $CONFIG_DIR/.env.testing $WEB_DIR/.env.testing;
 

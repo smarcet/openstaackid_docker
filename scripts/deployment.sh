@@ -1,6 +1,8 @@
 #!/bin/bash
 
 DEPLOY_TYPE=$1
+ROLE=$2
+CHANGE=$3
 
 echo "DEPLOY_TYPE $DEPLOY_TYPE";
 
@@ -41,18 +43,6 @@ if [ -z "$DEPLOY_TYPE" ]; then
     DEPLOY_TYPE=0;
 fi
 
-
-if [[ -n "$OVERRIDE_TAG" ]]; then
-    echo "overriding repo tag"
-    TAG=$OVERRIDE_TAG;
-fi
-
-if [[ -n "$OVERRIDE_CHANGE" ]]; then
-    echo "overriding repo change"
-    CHANGE=$OVERRIDE_CHANGE;
-fi
-
-
 DEPLOYMENT_ID_FILE=$RELEASE_BASE_DIR/.deploymentid
 
 if [ -f $DEPLOYMENT_ID_FILE ]; then
@@ -73,6 +63,11 @@ chmod 770 -R $RELEASE_BASE_DIR/$DEPLOYMENT_ID;
 chown :www-data -R $RELEASE_BASE_DIR/$DEPLOYMENT_ID;
 echo "clonning repo: git clone -b $BRANCH $REPO_URL $RELEASE_BASE_DIR/$DEPLOYMENT_ID";
 git clone -b $BRANCH $REPO_URL $RELEASE_BASE_DIR/$DEPLOYMENT_ID;
+cd $RELEASE_BASE_DIR/$DEPLOYMENT_ID && git fetch
+if [[ -n "$CHANGE" ]]; then
+    echo "checking out change $CHANGE"
+    cd $RELEASE_BASE_DIR/$DEPLOYMENT_ID && git checkout $CHANGE
+fi
 
 if [[ $? -ne 0 ]]; then
   error_email;
@@ -146,13 +141,15 @@ if [[ $DB_SEED -eq 1 ]]; then
     fi
 fi
 
-echo 'STOP nginx web server ...';
-if [[ $DEPLOY_TYPE -eq 1 ]]; then
-   service php$PHP_VERSION-fpm stop;
-   service nginx stop;
-else
-   supervisorctl stop phpfpm;
-   supervisorctl stop nginx;
+if [[ $ROLE == "DEPLOY" ]]; then
+  echo 'STOP nginx web server ...';
+  if [[ $DEPLOY_TYPE -eq 1 ]]; then
+     service php$PHP_VERSION-fpm stop;
+     service nginx stop;
+  else
+     supervisorctl stop phpfpm;
+     supervisorctl stop nginx;
+  fi
 fi
 
 files=$(cd $RELEASE_BASE_DIR && ls -t | tail -n +4)
@@ -169,24 +166,25 @@ echo "relinking site to new slot $RELEASE_BASE_DIR/$DEPLOYMENT_ID to $WEB_DIR";
 rm -f $WEB_DIR;
 ln -s $RELEASE_BASE_DIR/$DEPLOYMENT_ID $WEB_DIR;
 
-if [[ $DEPLOY_TYPE -eq 1 ]]; then
-   echo 'restarting PHP-FPM...';
-   service php$PHP_VERSION-fpm restart;
-else
-  echo 'restarting PHP-FPM...';
-  supervisorctl start phpfpm;
-  echo 'cleannin PHP-FPM cache...';
-  service php$PHP_VERSION-fpm reload
-  echo 'restarting NGINX ...';
-  supervisorctl start nginx;
-fi
+if [[ $ROLE == "DEPLOY" ]]; then
+  if [[ $DEPLOY_TYPE -eq 1 ]]; then
+     echo 'restarting PHP-FPM...';
+     service php$PHP_VERSION-fpm restart;
+  else
+    echo 'restarting PHP-FPM...';
+    supervisorctl start phpfpm;
+    echo 'cleannin PHP-FPM cache...';
+    service php$PHP_VERSION-fpm reload
+    echo 'restarting NGINX ...';
+    supervisorctl start nginx;
+  fi
+  echo "Restarting laravel queue worker ...";
+  cd $WEB_DIR && php artisan queue:restart;
 
-echo "Restarting laravel queue worker ...";
-cd $WEB_DIR && php artisan queue:restart;
-
-if [[ $DEPLOY_TYPE -eq 0 ]]; then
-  echo "supervisorctl reload";
-  supervisorctl reload;
+  if [[ $DEPLOY_TYPE -eq 0 ]]; then
+    echo "supervisorctl reload";
+    supervisorctl reload;
+  fi
 fi
 
 exit 0;
